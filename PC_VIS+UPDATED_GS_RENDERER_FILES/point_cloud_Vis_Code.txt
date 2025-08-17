@@ -1,0 +1,214 @@
+!pip install open3d
+
+import struct
+import numpy as np
+import open3d as o3d
+import matplotlib.pyplot as plt
+
+# ---------- COLMAP READERS ----------
+def read_points3D_binary(path):
+    xyzs, rgbs = [], []
+    with open(path, "rb") as fid:
+        while True:
+            binary_point3D_id = fid.read(8)
+            if not binary_point3D_id:
+                break
+
+            _ = struct.unpack("<Q", binary_point3D_id)[0]         # point3D_id
+            xyz = struct.unpack("<ddd", fid.read(24))             # X, Y, Z
+            rgb = struct.unpack("<BBB", fid.read(3))              # R, G, B
+            _ = struct.unpack("<d", fid.read(8))[0]               # error
+            track_length = struct.unpack("<Q", fid.read(8))[0]    # track length
+
+            # read track entries (image_id, point2D_idx)
+            for _ in range(track_length):
+                fid.read(4)  # image_id (int32)
+                fid.read(4)  # point2D_idx (int32)
+
+            xyzs.append(xyz)
+            rgbs.append(rgb)
+
+    return np.array(xyzs), np.array(rgbs) / 255.0
+
+def read_cameras_binary(path):
+    cameras = {}
+    with open(path, "rb") as fid:
+        while True:
+            camera_properties = fid.read(24)
+            if not camera_properties:
+                break
+            cam_id, model_id, width, height = struct.unpack("<iiQQ", camera_properties)
+            num_params = {0:0, 1:1, 2:5, 3:8, 4:4, 5:3, 6:1, 7:2, 8:3, 9:4}[model_id]  # pinhole etc.
+            params = struct.unpack("<" + "d" * num_params, fid.read(8 * num_params))
+            cameras[cam_id] = (width, height, params)
+    return cameras
+
+def read_images_binary(path):
+    images = {}
+    with open(path, "rb") as fid:
+        while True:
+            binary_img_id = fid.read(8)
+            if not binary_img_id:
+                break
+            image_id = struct.unpack("<Q", binary_img_id)[0]
+            qvec = struct.unpack("<dddd", fid.read(32))  # quaternion
+            tvec = struct.unpack("<ddd", fid.read(24))   # translation
+            camera_id = struct.unpack("<Q", fid.read(8))[0]
+            name = b""
+            while True:
+                c = fid.read(1)
+                if c == b"\x00":
+                    break
+                name += c
+            images[image_id] = {"qvec": np.array(qvec), "tvec": np.array(tvec),
+                                "camera_id": camera_id, "name": name.decode("utf-8")}
+            num_points2D = struct.unpack("<Q", fid.read(8))[0]
+            fid.read(24 * num_points2D)  # skip 2D points
+    return images
+
+# ---------- QUATERNION → ROTATION ----------
+def qvec2rotmat(qvec):
+    q0, q1, q2, q3 = qvec
+    return np.array([
+        [1 - 2 * q2**2 - 2 * q3**2,     2 * q1*q2 - 2 * q0*q3,     2 * q1*q3 + 2 * q0*q2],
+        [2 * q1*q2 + 2 * q0*q3,         1 - 2 * q1**2 - 2 * q3**2, 2 * q2*q3 - 2 * q0*q1],
+        [2 * q1*q3 - 2 * q0*q2,         2 * q2*q3 + 2 * q0*q1,     1 - 2 * q1**2 - 2 * q2**2]
+    ])
+
+# ---------- BUILD OPEN3D OBJECTS ----------
+def create_camera_frustum(scale=0.1, color=[1,0,0]):
+    # Simple pyramid camera model
+    pts = np.array([[0,0,0], [1,1,2], [1,-1,2], [-1,-1,2], [-1,1,2]]) * scale
+    lines = [[0,1],[0,2],[0,3],[0,4],[1,2],[2,3],[3,4],[4,1]]
+    colors = [color for _ in lines]
+    line_set = o3d.geometry.LineSet()
+    line_set.points = o3d.utility.Vector3dVector(pts)
+    line_set.lines = o3d.utility.Vector2iVector(lines)
+    line_set.colors = o3d.utility.Vector3dVector(colors)
+    return line_set
+
+def add_cameras_to_scene(images, geometries, scale=0.1):
+    for img in images.values():
+        R = qvec2rotmat(img["qvec"])
+        t = img["tvec"].reshape(3,1)
+        cam_center = -R.T @ t
+        frustum = create_camera_frustum(scale=scale)
+        frustum.translate(cam_center.flatten())
+        geometries.append(frustum)
+    return geometries
+
+# ---------- MAIN PIPELINE ----------
+scene_path = "/content/EDGS/assets/video_colmaped/scene/sparse/0"
+
+xyz, rgb = read_points3D_binary(scene_path + "/points3D.bin")
+images = read_images_binary(scene_path + "/images.bin")
+cameras = read_cameras_binary(scene_path + "/cameras.bin")
+
+# Point cloud
+pcd = o3d.geometry.PointCloud()
+pcd.points = o3d.utility.Vector3dVector(xyz)
+pcd.colors = o3d.utility.Vector3dVector(rgb)
+
+geometries = [pcd]
+geometries = add_cameras_to_scene(images, geometries, scale=0.2)
+
+# Colab-friendly snapshot
+vis = o3d.visualization.Visualizer()
+vis.create_window(visible=False)
+for g in geometries:
+    vis.add_geometry(g)
+vis.poll_events()
+vis.update_renderer()
+vis.capture_screen_image("colmap_scene.png")
+vis.destroy_window()
+
+plt.imshow(plt.imread("colmap_scene.png"))
+plt.axis("off")
+plt.show()
+
+
+--------------------------
+--------------------------
+Config File Gaussian Splat
+--------------------------
+--------------------------
+
+==> cfg.gs.sh_degree: 3 → controls how finely the model can represent directional/lighting details per Gaussian [Higher values = more detail,  lower = faster but 			   blurrier lighting/appearance]
+
+==> cfg.gs.viewpoint_stack : null → consistent camera positions for testing or rendering [By giving your camera posses - viewpoint stack]
+
+==> cfg.gs.opt.percent_dense: 0.01 → How much densification [Adding more splats] percentage
+
+==> cfg.gs.opt.lambda_dssim : 0.2 → controls perceptual loss weight.
+
+==> cfg.gs.opt.densification_interval : 100 → how often to add new points.
+
+==> cfg.gs.opt.opacity_reset_interval : 30000 → resets opacity to avoid dominance.
+
+==> cfg.gs.opt.densify_from_iter/densify_until_iter : 500/15000 → when densification happens.
+
+==> cfg.gs.opt.densify_grad_threshold : 0.0002 → which regions get densified.
+ 
+==> cfg.gs.opt.random_background: false → For assigning random background [Generalize scene learning&training]
+
+==> cfg.gs.pipe.antialiasing: false → For Smoother Coveriance
+
+
+----------------------------------------------------------------
+----------------------------------------------------------------
+
+
+cfg.gs.dataset.images="images"
+cfg.gs.opt.TEST_CAM_IDX_TO_LOG=12
+cfg.train.gs_epochs=30000
+cfg.gs.opt.opacity_reset_interval=3_000
+cfg.train.no_densify=False
+cfg.init_wC.matches_per_ref=15_000
+cfg.init_wC.nns_per_ref=3
+cfg.init_wC.num_refs=180
+cfg.init_wC.roma_model="outdoors"
+
+
+cfg.gs.opt.batch_size = 4096   # or 1024/4096 if GPU allows
+cfg.gs.opt.feature_lr = 0.001
+cfg.gs.opt.opacity_lr = 0.01
+cfg.gs.opt.position_lr_init = 0.0005
+cfg.gs.dataset.white_background = True
+cfg.gs.pipe.antialiasing = True
+cfg.init_wC.add_SfM_init = True
+cfg.init_wC.scaling_factor = 0.001
+
+------------
+
+
+cfg.wandb.name="EDGS.demo.scene"
+cfg.wandb.mode="disabled" # "online"
+cfg.gs.dataset.model_path="./scene_edgsed/"  # "change this to your path to the processed scene"
+#cfg.gs.dataset.source_path="../assets/scene_colmaped/" # "change this to your path"
+
+cfg.gs.dataset.source_path="./assets/video_colmaped/scene"  # < --- For Video
+
+cfg.gs.dataset.images="images"
+cfg.gs.opt.TEST_CAM_IDX_TO_LOG=12
+cfg.train.gs_epochs=30000
+cfg.gs.opt.opacity_reset_interval=3_000
+cfg.train.no_densify=False
+cfg.init_wC.matches_per_ref=15_000
+cfg.init_wC.nns_per_ref=3
+cfg.init_wC.num_refs=180
+cfg.init_wC.roma_model="outdoors"
+
+
+cfg.gs.opt.batch_size = 2048   # or 1024/2048/4096 if GPU allows
+cfg.gs.opt.feature_lr = 0.0025
+cfg.gs.opt.opacity_lr = 0.01
+cfg.gs.opt.position_lr_init = 0.00016
+cfg.gs.dataset.white_background = True
+cfg.gs.pipe.antialiasing = True
+cfg.init_wC.add_SfM_init = True
+cfg.init_wC.scaling_factor = 0.001
+
+cfg.gs.opt.scaling_lr = 0.005
+cfg.gs.opt.densify_from_iter = 500
+cfg.gs.opt.densify_until_iter = 15000
+cfg.gs.opt.densification_interval = 50
